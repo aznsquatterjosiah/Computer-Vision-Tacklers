@@ -1,8 +1,8 @@
 
 # ============================================
-# Names: Josiah Villaflor
-# Student Number: 23389559
-# CITS4402 Project - GUI starter with face detection and bulk processing
+# Names: Josiah Villaflor, Shriram Narendran, Abraham Amanyar
+# Student Number: 23389559, 23972901, 23460391
+# CITS4402 Project
 # ============================================
 
 import os
