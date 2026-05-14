@@ -23,6 +23,12 @@ import mediapipe as mp
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 MODEL_FILENAME = "face_landmarker.task"
 
+# URLs for OpenCV DNN face detector (res10 SSD)
+DNN_PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+DNN_PROTOTXT_FILE = "deploy.prototxt"
+DNN_CAFFEMODEL_URL = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+DNN_CAFFEMODEL_FILE = "res10_300x300_ssd_iter_140000.caffemodel"
+
 
 class FaceProjectGUI:
     def __init__(self, root):
@@ -42,10 +48,12 @@ class FaceProjectGUI:
         self.current_input_bgr = None
         self.current_output_bgr = None
 
-        # face detector (Haar cascade)
-        self.face_detector = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        # face detector (OpenCV DNN SSD - more accurate than Haar cascade)
+        self.dnn_prototxt, self.dnn_model = self.get_dnn_model_paths()
+        self.face_detector = cv2.dnn.readNetFromCaffe(
+            str(self.dnn_prototxt), str(self.dnn_model)
         )
+        self.dnn_confidence_threshold = 0.45
 
         # download the face landmarker model if it doesn't exist yet
         self.model_path = self.get_model_path()
@@ -172,6 +180,32 @@ class FaceProjectGUI:
                 raise
 
         return model_path
+
+    def get_dnn_model_paths(self):
+        """Download the OpenCV DNN face detector files if needed."""
+        script_dir = Path(__file__).resolve().parent
+        prototxt_path = script_dir / DNN_PROTOTXT_FILE
+        caffemodel_path = script_dir / DNN_CAFFEMODEL_FILE
+
+        for url, path, name in [
+            (DNN_PROTOTXT_URL, prototxt_path, DNN_PROTOTXT_FILE),
+            (DNN_CAFFEMODEL_URL, caffemodel_path, DNN_CAFFEMODEL_FILE)
+        ]:
+            if not path.exists():
+                print(f"Downloading {name} ...")
+                try:
+                    urllib.request.urlretrieve(url, str(path))
+                    print(f"Downloaded {name}.")
+                except Exception as e:
+                    messagebox.showerror(
+                        "Model Download Failed",
+                        f"Could not download {name}.\n"
+                        f"Please download it manually from:\n{url}\n"
+                        f"and place it next to your script.\n\nError: {e}"
+                    )
+                    raise
+
+        return prototxt_path, caffemodel_path
 
     def prepare_tk_image(self, bgr_image):
         rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
@@ -313,36 +347,49 @@ class FaceProjectGUI:
     # -------------------------------------------------------
 
     def detect_faces(self, image_bgr):
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
+        h, w = image_bgr.shape[:2]
 
-        detections = self.face_detector.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(40, 40)
+        # DNN SSD expects a 300x300 blob
+        blob = cv2.dnn.blobFromImage(
+            image_bgr, 1.0, (300, 300), (104.0, 177.0, 123.0), False, False
         )
+        self.face_detector.setInput(blob)
+        detections = self.face_detector.forward()
 
-        squares = []
-        for (x, y, w, h) in detections:
-            side = int(max(w, h) * 1.25)
-            cx = x + w // 2
-            cy = y + h // 2
+        boxes = []
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence < self.dnn_confidence_threshold:
+                continue
 
-            x1 = max(0, cx - side // 2)
-            y1 = max(0, cy - side // 2)
-            x2 = min(image_bgr.shape[1], x1 + side)
-            y2 = min(image_bgr.shape[0], y1 + side)
+            # DNN returns normalised coords, convert to pixel positions
+            x1 = max(0, int(detections[0, 0, i, 3] * w))
+            y1 = max(0, int(detections[0, 0, i, 4] * h))
+            x2 = min(w, int(detections[0, 0, i, 5] * w))
+            y2 = min(h, int(detections[0, 0, i, 6] * h))
 
-            side = min(x2 - x1, y2 - y1)
-            x2 = x1 + side
-            y2 = y1 + side
+            # expand into a square box with some padding
+            bw = x2 - x1
+            bh = y2 - y1
+            side = int(max(bw, bh) * 1.25)
+            cx = x1 + bw // 2
+            cy = y1 + bh // 2
+
+            sx1 = max(0, cx - side // 2)
+            sy1 = max(0, cy - side // 2)
+            sx2 = min(w, sx1 + side)
+            sy2 = min(h, sy1 + side)
+
+            # keep it square after clipping
+            side = min(sx2 - sx1, sy2 - sy1)
+            sx2 = sx1 + side
+            sy2 = sy1 + side
 
             if side > 0:
-                squares.append((x1, y1, x2, y2))
+                boxes.append((sx1, sy1, sx2, sy2))
 
-        squares = self.filter_and_limit_boxes(image_bgr, squares)
-        return squares
+        boxes = self.filter_and_limit_boxes(image_bgr, boxes)
+        return boxes
 
     def skin_mask_ratio(self, image_bgr, box):
         x1, y1, x2, y2 = box
@@ -485,62 +532,51 @@ class FaceProjectGUI:
             (w - self.aligned_size, h - self.aligned_size)   # bottom-right
         ]
 
-        for i, box in enumerate(boxes):
+        corner_idx = 0  # tracks which corner to use next
+
+        for box in boxes:
             x1, y1, x2, y2 = box
 
-            # draw the bounding box on the output image
+            # detect landmarks first - if they fail, this isn't a real face
+            landmarks = self.detect_landmarks(image_bgr, box)
+            if landmarks is None:
+                continue
+
+            right_eye, left_eye, nose_tip = landmarks
+
+            # landmarks found so this is a valid face - draw the bounding box
             cv2.rectangle(output, (x1, y1), (x2, y2),
                           self.face_box_color, self.face_box_thickness)
 
-            # try to detect landmarks within this face box
-            landmarks = self.detect_landmarks(image_bgr, box)
+            # draw landmark circles on the main output image
+            self.draw_landmark_circles(output, right_eye, left_eye, nose_tip, radius=4)
 
-            if landmarks is not None:
-                right_eye, left_eye, nose_tip = landmarks
+            # compute the aligned 125x125 crop
+            aligned_crop = self.align_face(image_bgr, landmarks)
 
-                # draw landmark circles on the main output image
-                self.draw_landmark_circles(output, right_eye, left_eye, nose_tip, radius=4)
+            # draw landmark circles on the aligned crop at target positions
+            self.draw_landmark_circles(
+                aligned_crop,
+                self.target_landmarks[0],  # right eye target
+                self.target_landmarks[1],  # left eye target
+                self.target_landmarks[2],  # nose target
+                radius=3
+            )
 
-                # compute the aligned 125x125 crop
-                aligned_crop = self.align_face(image_bgr, landmarks)
+            # place the aligned crop in the next available corner
+            if corner_idx < len(corners):
+                cx, cy = corners[corner_idx]
+                output[cy:cy + self.aligned_size, cx:cx + self.aligned_size] = aligned_crop
+                corner_idx += 1
 
-                # draw landmark circles on the aligned crop at target positions
-                self.draw_landmark_circles(
-                    aligned_crop,
-                    self.target_landmarks[0],  # right eye target
-                    self.target_landmarks[1],  # left eye target
-                    self.target_landmarks[2],  # nose target
-                    radius=3
-                )
+            # for bulk processing, save a clean crop without landmarks
+            clean_crop = self.align_face(image_bgr, landmarks)
 
-                # place the aligned crop in the appropriate corner
-                if i < len(corners):
-                    cx, cy = corners[i]
-                    output[cy:cy + self.aligned_size, cx:cx + self.aligned_size] = aligned_crop
-
-                # for bulk processing, save a clean crop without landmarks
-                clean_crop = self.align_face(image_bgr, landmarks)
-
-                faces_info.append({
-                    "box": box,
-                    "crop": clean_crop,
-                    "landmarks": landmarks
-                })
-
-            else:
-                # landmarks not found, fall back to a basic resized crop
-                raw_crop = image_bgr[y1:y2, x1:x2].copy()
-                fallback_crop = cv2.resize(raw_crop, (self.aligned_size, self.aligned_size))
-
-                if i < len(corners):
-                    cx, cy = corners[i]
-                    output[cy:cy + self.aligned_size, cx:cx + self.aligned_size] = fallback_crop
-
-                faces_info.append({
-                    "box": box,
-                    "crop": fallback_crop,
-                    "landmarks": None
-                })
+            faces_info.append({
+                "box": box,
+                "crop": clean_crop,
+                "landmarks": landmarks
+            })
 
         return output, faces_info
 
